@@ -1,0 +1,403 @@
+#!/bin/bash
+# =============================================
+# GRAYLOG AUTOMATED INSTALLATION SCRIPT
+# For Ubuntu 22.04 / 24.04 - Single Node
+# =============================================
+
+set -e  # Exit on error
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# =============================================
+# CONFIGURATION - EDIT THESE VALUES
+# =============================================
+
+# Server Configuration
+GRAYLOG_VERSION="7.1"
+MONGODB_VERSION="8.0"
+HTTP_BIND_ADDRESS="0.0.0.0:9000"
+HTTP_EXTERNAL_URI="http://YOUR_SERVER_IP:9000/"
+
+# Memory Settings (Adjust based on your server)
+# Graylog Heap: Set to half your RAM (max 16GB)
+# Data Node Heap: Set to half your RAM (max 31GB)
+GRAYLOG_HEAP="2g"      # e.g., 2g for 4GB RAM, 4g for 8GB RAM
+DATANODE_HEAP="4g"     # e.g., 4g for 8GB RAM, 8g for 16GB RAM
+
+# Root Password (Change this!)
+ROOT_PASSWORD="admin@123"  # This will be hashed automatically
+
+# MongoDB Bind IP (Use 0.0.0.0 for all interfaces, or specific IP)
+MONGODB_BIND_IP="0.0.0.0"
+
+# Journal Settings (Adjust based on expected log volume)
+JOURNAL_MAX_AGE="72h"
+JOURNAL_MAX_SIZE="90gb"
+
+# =============================================
+# FUNCTIONS
+# =============================================
+
+print_header() {
+    echo ""
+    echo "============================================"
+    echo "   $1"
+    echo "============================================"
+    echo ""
+}
+
+print_status() {
+    echo -e "${BLUE}[+] $1${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}❌ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠️  $1${NC}"
+}
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        print_error "Please run as root (sudo)"
+        exit 1
+    fi
+}
+
+# =============================================
+# STEP 1: SYSTEM PREPARATION
+# =============================================
+
+prepare_system() {
+    print_header "STEP 1: System Preparation"
+    
+    print_status "Updating package lists..."
+    apt-get update -qq
+    
+    print_status "Installing prerequisites..."
+    apt-get install -y -qq gnupg curl wget apt-transport-https software-properties-common \
+        netcat-openbsd openjdk-17-jre-headless
+
+    print_status "Setting timezone to UTC..."
+    timedatectl set-timezone UTC
+    
+    print_success "System preparation complete"
+}
+
+# =============================================
+# STEP 2: INSTALL MONGODB
+# =============================================
+
+install_mongodb() {
+    print_header "STEP 2: Installing MongoDB"
+    
+    print_status "Importing MongoDB public key..."
+    curl -fsSL "https://www.mongodb.org/static/pgp/server-${MONGODB_VERSION}.asc" | \
+        gpg -o /usr/share/keyrings/mongodb-server-${MONGODB_VERSION}.gpg --dearmor
+    
+    print_status "Adding MongoDB repository..."
+    echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-${MONGODB_VERSION}.gpg ] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/${MONGODB_VERSION} multiverse" | \
+        tee /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list
+    
+    print_status "Installing MongoDB..."
+    apt-get update -qq
+    apt-get install -y -qq mongodb-org
+    
+    print_status "Holding MongoDB packages..."
+    apt-mark hold mongodb-org
+    
+    print_status "Configuring MongoDB to bind to all interfaces..."
+    cat > /etc/mongod.conf << EOF
+# MongoDB Configuration for Graylog
+storage:
+  dbPath: /var/lib/mongodb
+  journal:
+    enabled: true
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+
+net:
+  port: 27017
+  bindIpAll: true
+
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+EOF
+    
+    print_status "Starting MongoDB..."
+    systemctl daemon-reload
+    systemctl enable mongod
+    systemctl start mongod
+    
+    # Wait for MongoDB to start
+    sleep 5
+    
+    # Test MongoDB connection
+    if mongosh --eval "db.runCommand({ping:1})" &>/dev/null; then
+        print_success "MongoDB is running and accessible"
+    else
+        print_error "MongoDB failed to start. Check logs: /var/log/mongodb/mongod.log"
+        exit 1
+    fi
+}
+
+# =============================================
+# STEP 3: INSTALL GRAYLOG DATA NODE
+# =============================================
+
+install_datanode() {
+    print_header "STEP 3: Installing Graylog Data Node"
+    
+    print_status "Configuring vm.max_map_count..."
+    echo 'vm.max_map_count=262144' | tee -a /etc/sysctl.d/99-graylog-datanode.conf
+    sysctl --system
+    
+    print_status "Adding Graylog repository..."
+    wget -q "https://packages.graylog2.org/repo/packages/graylog-${GRAYLOG_VERSION}-repository_latest.deb"
+    dpkg -i "graylog-${GRAYLOG_VERSION}-repository_latest.deb"
+    apt-get update -qq
+    
+    print_status "Installing Graylog Data Node..."
+    apt-get install -y -qq graylog-datanode
+    
+    print_status "Generating password secret..."
+    PASSWORD_SECRET=$(openssl rand -hex 32)
+    
+    print_status "Configuring Data Node..."
+    cat > /etc/graylog/datanode/datanode.conf << EOF
+# Graylog Data Node Configuration
+password_secret = ${PASSWORD_SECRET}
+mongodb_uri = mongodb://localhost:27017/graylog
+opensearch_heap = ${DATANODE_HEAP}
+
+# HTTP settings
+http_bind_address = 0.0.0.0:9200
+EOF
+    
+    print_status "Starting Data Node..."
+    systemctl daemon-reload
+    systemctl enable graylog-datanode
+    systemctl start graylog-datanode
+    
+    # Wait for Data Node to start
+    sleep 10
+    
+    # Check Data Node status
+    if systemctl is-active --quiet graylog-datanode; then
+        print_success "Graylog Data Node is running"
+    else
+        print_error "Data Node failed to start. Check: /var/log/graylog-datanode/datanode.log"
+        exit 1
+    fi
+}
+
+# =============================================
+# STEP 4: INSTALL GRAYLOG SERVER
+# =============================================
+
+install_graylog() {
+    print_header "STEP 4: Installing Graylog Server"
+    
+    print_status "Installing Graylog Server..."
+    apt-get install -y -qq graylog-server
+    
+    print_status "Generating root password hash..."
+    ROOT_PASSWORD_HASH=$(echo -n "${ROOT_PASSWORD}" | sha256sum | cut -d" " -f1)
+    
+    print_status "Configuring Graylog Server..."
+    
+    # Get server IP
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    HTTP_EXTERNAL_URI="http://${SERVER_IP}:9000/"
+    
+    cat > /etc/graylog/server/server.conf << EOF
+# Graylog Server Configuration
+is_leader = true
+node_id_file = /etc/graylog/server/node-id
+
+# Security
+password_secret = ${PASSWORD_SECRET}
+root_password_sha2 = ${ROOT_PASSWORD_HASH}
+root_timezone = Asia/Kolkata
+
+# HTTP settings
+http_bind_address = ${HTTP_BIND_ADDRESS}
+http_external_uri = ${HTTP_EXTERNAL_URI}
+
+# Data Node
+datanode_hosts = http://localhost:9200
+
+# MongoDB
+mongodb_uri = mongodb://localhost:27017/graylog
+
+# Journal settings
+message_journal_enabled = true
+message_journal_dir = /var/lib/graylog-server/journal
+message_journal_max_age = ${JOURNAL_MAX_AGE}
+message_journal_max_size = ${JOURNAL_MAX_SIZE}
+
+# Input buffer settings
+inputbuffer_ring_size = 65536
+inputbuffer_wait_strategy = blocking
+
+# Output settings
+output_batch_size = 500
+output_flush_interval = 1
+outputbuffer_processors = 3
+
+# Processor settings
+processor_wait_strategy = blocking
+ring_size = 65536
+
+# Email settings (Disabled by default - enable if needed)
+transport_email_enabled = false
+EOF
+    
+    print_status "Configuring Graylog heap settings..."
+    mkdir -p /etc/default
+    cat > /etc/default/graylog-server << EOF
+GRAYLOG_SERVER_JAVA_OPTS="-Xms${GRAYLOG_HEAP} -Xmx${GRAYLOG_HEAP} -server -XX:+UseG1GC -XX:-OmitStackTraceInFastThrow"
+EOF
+    
+    print_status "Starting Graylog Server..."
+    systemctl daemon-reload
+    systemctl enable graylog-server
+    systemctl start graylog-server
+    
+    # Wait for Graylog to start
+    sleep 15
+    
+    if systemctl is-active --quiet graylog-server; then
+        print_success "Graylog Server is running"
+    else
+        print_error "Graylog Server failed to start. Check: /var/log/graylog-server/server.log"
+        exit 1
+    fi
+}
+
+# =============================================
+# STEP 5: POST-INSTALLATION SETUP
+# =============================================
+
+post_setup() {
+    print_header "STEP 5: Post-Installation Setup"
+    
+    print_status "Waiting for Graylog to fully initialize..."
+    sleep 30
+    
+    print_status "Checking services..."
+    
+    echo ""
+    echo "📊 Service Status:"
+    echo "----------------------------------------"
+    
+    # Check MongoDB
+    if systemctl is-active --quiet mongod; then
+        echo -e "   ${GREEN}✅ MongoDB: Running${NC}"
+    else
+        echo -e "   ${RED}❌ MongoDB: Not running${NC}"
+    fi
+    
+    # Check Data Node
+    if systemctl is-active --quiet graylog-datanode; then
+        echo -e "   ${GREEN}✅ Data Node: Running${NC}"
+    else
+        echo -e "   ${RED}❌ Data Node: Not running${NC}"
+    fi
+    
+    # Check Graylog
+    if systemctl is-active --quiet graylog-server; then
+        echo -e "   ${GREEN}✅ Graylog Server: Running${NC}"
+    else
+        echo -e "   ${RED}❌ Graylog Server: Not running${NC}"
+    fi
+    
+    echo "----------------------------------------"
+    echo ""
+}
+
+# =============================================
+# STEP 6: DISPLAY ACCESS INFORMATION
+# =============================================
+
+display_info() {
+    print_header "INSTALLATION COMPLETE!"
+    
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    
+    echo "📋 Access Information:"
+    echo "----------------------------------------"
+    echo ""
+    echo -e "${GREEN}🌐 Graylog Web Interface:${NC}"
+    echo "   http://${SERVER_IP}:9000"
+    echo ""
+    echo -e "${YELLOW}🔑 Login Credentials:${NC}"
+    echo "   Username: admin"
+    echo "   Password: ${ROOT_PASSWORD}"
+    echo ""
+    echo -e "${BLUE}ℹ️  Important Notes:${NC}"
+    echo "   - First login may take a few minutes"
+    echo "   - Complete the preflight setup wizard"
+    echo "   - Configure your input sources"
+    echo ""
+    echo -e "${YELLOW}📁 Log Locations:${NC}"
+    echo "   Graylog: /var/log/graylog-server/server.log"
+    echo "   Data Node: /var/log/graylog-datanode/datanode.log"
+    echo "   MongoDB: /var/log/mongodb/mongod.log"
+    echo ""
+    echo -e "${BLUE}🔧 Useful Commands:${NC}"
+    echo "   sudo systemctl status graylog-server"
+    echo "   sudo systemctl status graylog-datanode"
+    echo "   sudo systemctl status mongod"
+    echo ""
+    echo "----------------------------------------"
+    echo -e "${GREEN}✅ Installation Complete! 🚀${NC}"
+    echo ""
+}
+
+# =============================================
+# MAIN EXECUTION
+# =============================================
+
+main() {
+    echo ""
+    echo "╔═══════════════════════════════════════╗"
+    echo "║     GRAYLOG INSTALLATION SCRIPT      ║"
+    echo "║         Ubuntu 22.04/24.04           ║"
+    echo "╚═══════════════════════════════════════╝"
+    echo ""
+    
+    check_root
+    
+    # Run installation steps
+    prepare_system
+    install_mongodb
+    install_datanode
+    install_graylog
+    post_setup
+    display_info
+    
+    # Save installation details
+    echo "Installation completed on $(date)" > /root/graylog_install.log
+    echo "Server IP: $(hostname -I | awk '{print $1}')" >> /root/graylog_install.log
+    echo "Root Password: ${ROOT_PASSWORD}" >> /root/graylog_install.log
+    echo "Password Secret: ${PASSWORD_SECRET}" >> /root/graylog_install.log
+    
+    print_success "Installation details saved to /root/graylog_install.log"
+}
+
+# Run the main function
+main "$@"
