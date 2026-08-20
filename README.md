@@ -67,7 +67,7 @@ sudo systemctl restart graylog-server
 # One-Line Installation
 curl -sSL https://raw.githubusercontent.com/your-repo/install_graylog.sh | sudo bash
 
-
+you can create
 
 
 
